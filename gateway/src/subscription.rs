@@ -271,11 +271,17 @@ fn guessed_video_source(payload_bytes: f64) -> Option<(u32, u32)> {
 }
 
 // Keep adaptive pictures from shrinking only because their content compresses well. Fixed-size
-// pictures already enforce their size, so price those from the actual wire bytes. Otherwise the
-// artificial byte floor caps Hz and prevents delivery-based bandwidth probing from recovering.
+// pictures can spend fewer bytes on compression before sacrificing Hz. Their best quality still
+// requests the policy's bitrate: pricing every quality from tiny static delta frames feeds that
+// low bitrate back into the encoder, starving subsequent keyframes even on an unconstrained link.
 fn video_price(policy: VideoPolicy, source: (u32, u32), hz: f64, measured: Option<(f64, f64)>) -> crate::allocator::Price {
     let model = move |quality: f64| policy.frame_bytes(source, hz, quality);
-    let floor = if policy.floor_scale(source) >= policy.fit(source) { 0.0 } else { policy.full_size_floor_bytes(source) };
+    if policy.floor_scale(source) >= policy.fit(source) {
+        let most = model(1.0);
+        let least = measured.map_or_else(|| model(0.0), |(_, bytes)| VIDEO_PRICE_HEADROOM * bytes).min(most);
+        return Box::new(move |quality| least + (most - least) * quality.clamp(0.0, 1.0));
+    }
+    let floor = policy.full_size_floor_bytes(source);
     Box::new(move |quality| match measured {
         Some((at, bytes)) => model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(floor)),
         None => model(quality),
@@ -1153,6 +1159,22 @@ mod tests {
         let source = (1920, 1080);
         assert!(video_price(policy, source, 30.0, Some((1.0, 1500.0)))(1.0) >= policy.full_size_floor_bytes(source));
         assert_eq!(video_price(policy, source, 30.0, None)(1.0), policy.frame_bytes(source, 30.0, 1.0));
+    }
+
+    #[test]
+    fn static_fixed_size_video_retains_bitrate_for_motion_and_keyframes() {
+        use crate::allocator::{allocate, Demand};
+        let policy = VideoPolicy { min_resolution_scale: 1.0, max_bitrate: Some(5_000_000.0), ..Default::default() };
+        let demand = || Demand { priority: 1.0, max_hz: 30.0, quality_range: Some((0.0, 1.0)), tradeoff: 1.0,
+            price: video_price(policy, (1920, 1536), 30.0, Some((1.0, 100.0))), fixed_bytes_per_sec: None, shrinks_last: false };
+        let full = allocate(1_000_000.0, &[demand()]);
+        assert_eq!(full[0].hz, 30.0);
+        assert_eq!(full[0].quality, Some(1.0));
+        assert_eq!(full[0].budget_bytes_per_sec, 625_000.0, "static delta frames must not collapse the encoder's available bitrate");
+        let constrained = allocate(150_000.0, &[demand()]);
+        assert_eq!(constrained[0].hz, 30.0, "compression gives way before frame rate");
+        assert!(constrained[0].quality.unwrap() < 1.0);
+        assert!(constrained[0].budget_bytes_per_sec <= 150_000.0);
     }
 
     #[test]
