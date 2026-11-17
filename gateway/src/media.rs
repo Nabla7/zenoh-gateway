@@ -1004,6 +1004,11 @@ const SESSION_LOG: usize = 8;
 const SAME_SAMPLE_MS: f64 = 2.0;
 /// Viewers share an encode while their grants are within this ratio of each other (it runs at the lowest).
 const SHARE_RATIO: f64 = 1.25;
+// Joining and leaving at the same boundary rebuilt encoders as independent
+// viewers' grants wobbled. Keep a wider band once sharing, and let a split
+// session settle before merging it back into another reference chain.
+const SHARE_KEEP_RATIO: f64 = 1.5;
+const SHARE_SETTLE: Duration = Duration::from_secs(5);
 
 /// The encodes of every video stream, shared by viewers of one stream at one target (SPEC "Video"). Each member of a
 /// session sends every frame of it, in order, so one encoder's reference chain serves them all.
@@ -1015,6 +1020,7 @@ pub struct VideoSessions {
 }
 
 struct EncodeSession {
+    created_at: Instant,
     /// creation order: a lone member moves to an older session it fits, so two never stay apart at one grant
     id: u64,
     codec: String,
@@ -1129,11 +1135,11 @@ struct SessionFrame {
 
 impl EncodeSession {
     /// Whether a member granted `bitrate` can share this session: the others' grants and its own are close.
-    fn fits(&self, member: u64, bitrate: f64) -> bool {
+    fn fits(&self, member: u64, bitrate: f64, ratio: f64) -> bool {
         let grants = self.grants.lock();
         let others = grants.iter().filter(|(id, _)| **id != member).map(|(_, (bps, _, _, _))| *bps);
         let (low, high) = others.fold((bitrate, bitrate), |(low, high), bps| (low.min(bps), high.max(bps)));
-        high <= low.max(1.0) * SHARE_RATIO
+        high <= low.max(1.0) * ratio
     }
 }
 
@@ -1141,12 +1147,16 @@ impl VideoSessions {
     /// The session `member` encodes in at `grant`: `current` while it still fits (unless it is alone there and an older
     /// session of the same stream and policy fits too), else the oldest such session that fits, else a new one.
     fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64, f64, bool)) -> Arc<EncodeSession> {
+        self.place_at(current, member, (codec, format, key), policy, grant, Instant::now())
+    }
+
+    fn place_at(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64, f64, bool), now: Instant) -> Arc<EncodeSession> {
         let mut sessions = self.sessions.lock();
         let same_stream = |session: &&Arc<EncodeSession>| session.codec == codec && session.format == format && session.key == key && session.policy == policy;
-        let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
+        let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0, SHARE_RATIO)).min_by_key(|session| session.id).cloned();
         let session = match (current, oldest_fit) {
             // the policy changes when the subscription is updated (updateSubscription)
-            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0) && (current.grants.lock().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
+            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0, SHARE_KEEP_RATIO) && (current.grants.lock().len() > 1 || now.saturating_duration_since(current.created_at) < SHARE_SETTLE || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
             (current, oldest) => {
                 if let Some(current) = current {
                     Self::leave_locked(&mut sessions, &current, member);
@@ -1154,7 +1164,7 @@ impl VideoSessions {
                 oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
                     let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default(), qp_shrunk: false, pending: VecDeque::new(), next_frame_id: 0 };
                     let id = self.next_session.fetch_add(1, Ordering::Relaxed);
-                    let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
+                    let session = Arc::new(EncodeSession { created_at: now, id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
                     sessions.push(session.clone());
                     session
                 })
@@ -1734,6 +1744,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn encode_sharing_does_not_flap_at_the_join_boundary() {
+        let sessions = VideoSessions::default();
+        let now = Instant::now();
+        let stream = ("camera", VideoFormat::H264, "cam");
+        let policy = VideoPolicy::default();
+        let grant = |bps| (bps, 30.0, bps, false);
+        let first = sessions.place_at(None, 1, stream, policy, grant(4e6), now);
+        let mut second = sessions.place_at(None, 2, stream, policy, grant(4.8e6), now);
+        assert!(Arc::ptr_eq(&first, &second));
+        for bps in [5.2e6, 4.8e6, 5.4e6, 4.8e6] {
+            second = sessions.place_at(Some(second), 2, stream, policy, grant(bps), now);
+            assert!(Arc::ptr_eq(&first, &second), "ordinary grant changes retain the encoder");
+        }
+        second = sessions.place_at(Some(second), 2, stream, policy, grant(12e6), now);
+        assert!(!Arc::ptr_eq(&first, &second), "a materially different budget splits immediately");
+        second = sessions.place_at(Some(second), 2, stream, policy, grant(4.2e6), now);
+        assert!(!Arc::ptr_eq(&first, &second), "do not immediately merge back and force another keyframe");
+        second = sessions.place_at(Some(second), 2, stream, policy, grant(4.2e6), now + SHARE_SETTLE);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     struct Camera(Arc<AtomicUsize>);
 
     impl MessageEncoding for Camera {
@@ -1777,7 +1809,7 @@ mod tests {
         // a viewer that started alone (its first grant was a guess) joins the older session once its grant fits there
         let late = sessions.place(None, 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (16e6, 30.0, 16e6, false));
         assert_eq!(sessions.count(), 3);
-        let merged = sessions.place(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0, 4.2e6, false));
+        let merged = sessions.place_at(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0, 4.2e6, false), Instant::now() + SHARE_SETTLE);
         assert!(Arc::ptr_eq(&merged, viewers[0].session.as_ref().unwrap()) && sessions.count() == 2);
         sessions.leave(&merged, 9);
         assert_eq!(encodes.load(Ordering::Relaxed), 20, "10 samples, encoded once per session");
