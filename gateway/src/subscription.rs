@@ -270,6 +270,18 @@ fn guessed_video_source(payload_bytes: f64) -> Option<(u32, u32)> {
     })
 }
 
+// Keep adaptive pictures from shrinking only because their content compresses well. Fixed-size
+// pictures already enforce their size, so price those from the actual wire bytes. Otherwise the
+// artificial byte floor caps Hz and prevents delivery-based bandwidth probing from recovering.
+fn video_price(policy: VideoPolicy, source: (u32, u32), hz: f64, measured: Option<(f64, f64)>) -> crate::allocator::Price {
+    let model = move |quality: f64| policy.frame_bytes(source, hz, quality);
+    let floor = if policy.floor_scale(source) >= policy.fit(source) { 0.0 } else { policy.full_size_floor_bytes(source) };
+    Box::new(move |quality| match measured {
+        Some((at, bytes)) => model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(floor)),
+        None => model(quality),
+    })
+}
+
 fn sample_timestamp_ms(sample: &Sample) -> f64 {
     let since_epoch = sample.timestamp().and_then(|ts| ts.get_time().to_system_time().duration_since(UNIX_EPOCH).ok());
     since_epoch.map_or_else(now_unix_ms, |d| d.as_secs_f64() * 1000.0)
@@ -495,17 +507,7 @@ impl SubShared {
               Some(source) => {
                 let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
                 let (policy, frame_hz) = (self.tuning().video_policy, max_hz / keys as f64);
-                let model = move |quality: f64| policy.frame_bytes(source, frame_hz, quality);
-                // what its frames measured, with room to grow 1.5x per allocation: a simple or still picture encodes far
-                // below the model, and priced by the model alone it never showed the link more (a solid 320x240 camera
-                // at 10 Hz was held to 5 fps on localhost)
-                // (never below the full picture's floor: grants follow the price and the picture's size follows the grant, so a
-                // solid picture's tiny frames shrank it to half size)
-                let (measured, full_size) = (state.video_frame_bytes, policy.full_size_floor_bytes(source));
-                Box::new(move |quality| match measured {
-                    Some((at, bytes)) => model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(full_size)),
-                    None => model(quality),
-                })
+                video_price(policy, source, frame_hz, state.video_frame_bytes)
               }
             },
             Some(codec) => {
@@ -1127,6 +1129,30 @@ mod tests {
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
+    }
+
+    #[test]
+    fn fixed_size_video_spends_measured_bytes_instead_of_starving_its_rate() {
+        use crate::allocator::{allocate, Demand};
+        let policy = VideoPolicy { min_resolution_scale: 1.0, ..Default::default() };
+        let demand = Demand { priority: 1.0, max_hz: 30.0, quality_range: Some((0.0, 1.0)), tradeoff: 1.0,
+            price: video_price(policy, (1920, 1080), 30.0, Some((0.0, 1500.0))), fixed_bytes_per_sec: None, shrinks_last: false };
+        // The old 25,920-byte picture floor limited this to <6 fps even though 30 fits.
+        assert_eq!(allocate(150_000.0, &[demand])[0].hz, 30.0);
+        let demand = Demand { priority: 1.0, max_hz: 30.0, quality_range: Some((0.0, 1.0)), tradeoff: 1.0,
+            price: video_price(policy, (1920, 1080), 30.0, Some((0.0, 1500.0))), fixed_bytes_per_sec: None, shrinks_last: false };
+        let allocation = &allocate(10_000.0, &[demand])[0];
+        assert!(allocation.hz < 30.0);
+        assert!(allocation.budget_bytes_per_sec <= 10_000.0);
+        assert_eq!(policy.size((1920, 1080), 80_000.0, allocation.hz, 1.0), (1920, 1080));
+    }
+
+    #[test]
+    fn adaptive_video_keeps_its_picture_floor_and_unknown_video_keeps_its_estimate() {
+        let policy = VideoPolicy::default();
+        let source = (1920, 1080);
+        assert!(video_price(policy, source, 30.0, Some((1.0, 1500.0)))(1.0) >= policy.full_size_floor_bytes(source));
+        assert_eq!(video_price(policy, source, 30.0, None)(1.0), policy.frame_bytes(source, 30.0, 1.0));
     }
 
     #[test]

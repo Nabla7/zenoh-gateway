@@ -80,7 +80,7 @@ impl VideoPolicy {
     }
 
     /// Share of the source's width and height that fits `max_resolution`.
-    fn fit(&self, (width, height): (u32, u32)) -> f64 {
+    pub(crate) fn fit(&self, (width, height): (u32, u32)) -> f64 {
         self.max_resolution.map_or(1.0, |(max_width, max_height)| (max_width as f64 / width as f64).min(max_height as f64 / height as f64).min(1.0))
     }
 
