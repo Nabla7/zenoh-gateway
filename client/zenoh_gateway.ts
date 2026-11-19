@@ -4,6 +4,8 @@
 /// <reference lib="esnext" />
 // zenoh-gateway browser client: one WebRTC data channel per subscription/publisher, see SPEC.md
 
+import {TraceRecorder, traceSchema, traceContext, tracePayload, type TraceContext} from "./diagnostics.ts"
+export {TraceRecorder} from "./diagnostics.ts"
 import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
 
 /** zenoh priorities (lower = more important). */
@@ -257,6 +259,8 @@ export interface AudioPublisherOptions {
 }
 
 export interface ConnectOptions {
+    /** Explicit capture; no telemetry is uploaded by the client. */
+    diagnostics?: TraceRecorder
     /** default: the gateway's (`GET /zenoh-gateway/ice`, TURN credentials minted for this client) */
     iceServers?: RTCIceServer[]
     /** "relay" forces every byte through TURN; default: the `/zenoh-gateway/ice` reply's `iceTransportPolicy`, else "all" */
@@ -565,6 +569,10 @@ export function decodeVideoFrameInfo(bytes: Uint8Array): VideoFrameInfo {
         ...(bytes.byteLength >= 64 && (bytes[1] & 2) !== 0 ? { rtpTimestamp: view.getUint32(44, true) } : {}),
         ...(bytes.byteLength >= 64 ? { receivedMs: view.getFloat64(48, true), encodedMs: view.getFloat64(56, true) } : {}),
         ...headerFields((bytes[1] & 4) !== 0 ? decodeHeader(bytes.subarray(64)) : undefined),
+        ...((bytes[1] & 8) !== 0 ? (() => {
+            const {encoding, attachment} = splitMeta(bytes.subarray(64));
+            return {encoding, attachment};
+        })() : {}),
     }
 }
 
@@ -821,6 +829,7 @@ export class Subscription extends Endpoint {
     #partials = new Map<number, PartialMessage>()
     /** video: recent frames' metadata by RTP timestamp, with their sample's timestamp */
     #videoTimes = new Map<number, { info: VideoFrameInfo, sourceMs: number }>()
+    #traceGeneration = 0
     #frameLatencies: FrameLatency[] = []
     #unmatchedFrames = 0
 
@@ -842,6 +851,7 @@ export class Subscription extends Endpoint {
                 return
             }
             handle = element.requestVideoFrameCallback(onFrame)
+            this.traceVideoFrame(frame.rtpTimestamp, "video.presented", {presentation_ns:Math.round(frame.presentationTime*1e6),expected_display_ns:Math.round(frame.expectedDisplayTime*1e6),processing_duration_s:frame.processingDuration,physical_display:false})
             const offsetMs = this.owner.clockOffsetMs
             if (frame.rtpTimestamp === undefined || offsetMs === null) {
                 return
@@ -885,6 +895,18 @@ export class Subscription extends Endpoint {
 
     /** The metadata of the frame a video element shows (a requestVideoFrameCallback's `rtpTimestamp`), e.g. its `stamp`
      * and `frameId` to place the picture on screen in its own TF frame; undefined if it is not among the latest 512. */
+    /** Record actual renderer boundaries using this track's RTP identity. No timestamp-only matching. */
+    traceVideoFrame(rtpTimestamp: number | undefined, stage: string, labels: Record<string,unknown> = {}): TraceContext | undefined {
+        const info = rtpTimestamp === undefined ? undefined : this.#videoTimes.get(rtpTimestamp)?.info
+        const trace = traceContext(info?.attachment)
+        this.owner.options.diagnostics?.event(stage,trace,{...labels,channel:this.key,generation:`${this.id}/${this.#traceGeneration}`,rtp_timestamp:rtpTimestamp,correlation:trace?"matched":"unavailable"})
+        if (stage === 'video.presented') this.owner.options.diagnostics?.observe(`video/${this.key}`,trace)
+        if (stage === 'video.texture_upload' || stage === 'video.render_submit' || stage === 'video.xr_submit') {
+            this.owner.options.diagnostics?.observe(`${stage}/${this.key}`,trace)
+        }
+        return trace
+    }
+
     videoFrameInfo(rtpTimestamp: number): VideoFrameInfo | undefined {
         return this.#videoTimes.get(rtpTimestamp)?.info
     }
@@ -958,6 +980,9 @@ export class Subscription extends Endpoint {
 
     attach(peer: RTCPeerConnection): void {
         this.#droppedBefore = this.dropped
+        this.#traceGeneration++
+        this.#videoTimes.clear()
+        this.#frameLatencies = []
         this.#firstSeq = -1
         this.#maxSeq = -1
         this.#receivedOnChannel = 0
@@ -1178,6 +1203,8 @@ export class Subscription extends Endpoint {
         if (message.seq > this.#maxSeq) {
             this.#maxSeq = message.seq
         }
+        const trace = traceContext(message.attachment)
+        this.owner.options.diagnostics?.event("transport.received",trace,{channel:this.key,transport:"WebRTC",generation:`${this.id}/${this.#traceGeneration}`})
         try {
             this.callback(message)
         } catch (error) {
@@ -1227,6 +1254,7 @@ export class Publisher extends Endpoint {
     /** why the gateway is dropping this publisher's puts right now (another client's lease), else null */
     blocked: string | null = null
     #last: Uint8Array | null = null
+    #lastContext?: TraceContext
     /** stamped frames waiting for the channel, with when they were put (reliable: all, latest: only the newest) */
     #pending: { frame: Uint8Array<ArrayBuffer>; at: number }[] = []
     #repeatTimer: ReturnType<typeof setInterval> | null = null
@@ -1237,7 +1265,9 @@ export class Publisher extends Endpoint {
         if (options.repeatMs) {
             this.#repeatTimer = setInterval(() => {
                 if (this.#last && !this.tripped && this.rejectionReason === null) {
-                    this.#send(encodePut(this.#last, this.owner.now()))
+                    const recorder = this.owner.options.diagnostics
+                    recorder?.event("browser.command_repeat", this.#lastContext, {channel:this.key})
+                    this.#send(encodePut(this.#lastContext ? tracePayload(this.#last, this.#lastContext) : this.#last, this.owner.now()))
                 }
             }, options.repeatMs)
         }
@@ -1265,7 +1295,8 @@ export class Publisher extends Endpoint {
 
     attach(peer: RTCPeerConnection): void {
         const { delivery, priority, latencyLimit } = this.options
-        const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit } })
+        const traceSchemaOption = this.owner.options.diagnostics ? traceSchema : undefined
+        const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit, traceSchema: traceSchemaOption } })
         const acceptance = this.beginAttempt()
         const channel = peer.createDataChannel(label, channelInit(delivery, latencyLimit, isStrict(priority)))
         channel.binaryType = "arraybuffer"
@@ -1298,13 +1329,17 @@ export class Publisher extends Endpoint {
         return this.owner.delete(this.key, options)
     }
 
-    put(value: Bytesish, { timestamp }: { timestamp?: number } = {}): void {
+    put(value: Bytesish, { timestamp, context }: { timestamp?: number, context?: TraceContext } = {}): void {
         this.attempted++
         this.lastAttemptAtMs = this.owner.now()
         this.#checkUsable()
         const bytes = toBytes(value)
         this.#last = bytes
-        this.#send(encodePut(bytes, timestamp ?? this.owner.now()))
+        const recorder = this.owner.options.diagnostics
+        const trace = recorder ? context ?? recorder.sample(this.key) : undefined
+        this.#lastContext = trace
+        recorder?.event("browser.command_capture", trace, {channel:this.key})
+        this.#send(encodePut(trace ? tracePayload(bytes, trace) : bytes, timestamp ?? this.owner.now()))
     }
 
     #send(frame: Uint8Array<ArrayBuffer>): void {
@@ -1323,6 +1358,10 @@ export class Publisher extends Endpoint {
     }
 
     #transmit(channel: RTCDataChannel, frame: Uint8Array) {
+        const recorder = this.owner.options.diagnostics
+        const length = recorder && frame.length >= 12 ? new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getUint32(8, true) : 0
+        const trace = length ? traceContext(frame.subarray(12,12+length)) : undefined
+        recorder?.event("browser.command_transmit",trace,{channel:this.key,queued_bytes:channel.bufferedAmount})
         channel.send(frame as Uint8Array<ArrayBuffer>)
         const stamp = new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getFloat64(0, true)
         if (this.lastSentAtMs !== null) this.maxSendGapMs = Math.max(this.maxSendGapMs, stamp - this.lastSentAtMs)
@@ -1520,7 +1559,7 @@ export class Lease {
     }
 }
 
-type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId">
+type ResolvedConnectOptions = Required<Omit<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId" | "diagnostics">> & Pick<ConnectOptions, "clock" | "iceServers" | "iceTransportPolicy" | "token" | "linkBandwidthBytesPerSec" | "linkId" | "diagnostics">
 
 export class ZenohGateway {
     state: ConnectionState = "connecting"
@@ -1560,6 +1599,8 @@ export class ZenohGateway {
     #nextId = 1
     #closed = false
     #generation = 0
+    #traceRoute = ""
+    #traceRouteGeneration = 0
     #statsTimer: ReturnType<typeof setInterval> | null = null
     /** when the next gateway stats may be asked for (`statsBudgetShare`) */
     #statsDueAt = 0
@@ -1683,6 +1724,7 @@ export class ZenohGateway {
             return
         }
         this.state = state
+        this.options.diagnostics?.event("network.connection",null,{state,generation:this.#generation})
         for (const listener of this.#stateListeners) {
             try {
                 listener(state)
@@ -1711,8 +1753,15 @@ export class ZenohGateway {
     /** Clock-sync ping over control; also reports our current estimate to the gateway. */
     async #controlPing(): Promise<void> {
         const t0 = this.now()
+        const recorder = this.options.diagnostics
+        const a0 = recorder?.now()
         const response = await this._request({ op: "ping", t0, offsetMs: this.clockOffsetMs, rttMs: this.rttMs }, pingTimeoutMs)
+        const a3 = recorder?.now()
         this.#addClockSample(t0, Number(response.t1), Number(response.t2), this.now())
+        const remote = response.diagnosticClock as {received_ns:number,sent_ns:number,clock_domain:string} | undefined
+        if (recorder && a0 !== undefined && a3 !== undefined && remote && a3-a0 >= remote.sent_ns-remote.received_ns) {
+            recorder.event("network.probe",null,{status:"ok",scope:"WebRTC control round trip",mapping:{local_domain:recorder.clockDomain,remote_domain:remote.clock_domain,lower_ns:remote.sent_ns-a3,upper_ns:remote.received_ns-a0,measured_ns:a3,valid_for_ns:10_000_000_000,drift_ppm:100}})
+        }
     }
 
     /** Opens (or re-opens) the peer connection and every channel on it. */
@@ -2288,6 +2337,14 @@ export class ZenohGateway {
         this.#statsDueAt = performance.now() + (response ? Math.min(maxStatsIntervalMs, share) : maxStatsIntervalMs)
         if (response) {
             this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null, selectedPath: response.selectedPath ?? null } as GatewayStats
+            const recorder = this.options.diagnostics
+            if (recorder) {
+                const path = response.selectedPath ?? null
+                const identity = JSON.stringify([this.#generation,path])
+                if (identity !== this.#traceRoute) {this.#traceRoute=identity;this.#traceRouteGeneration++}
+                recorder.event("network.ice_path",null,{path,generation:`${this.#generation}/${this.#traceRouteGeneration}`,evidence:"selected ICE endpoints; AP and backhaul unresolved"})
+                recorder.event("network.gateway_feedback",null,{bandwidth:response.bandwidth??null,generation:this.#generation})
+            }
             this.#updateCongestion((response.bandwidth ?? null) as Record<string, unknown> | null, (response.channels as GatewayChannelStats[] | undefined) ?? [])
         }
         this.#refreshStats((response?.channels as GatewayChannelStats[] | undefined) ?? null)

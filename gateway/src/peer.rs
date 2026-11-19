@@ -1549,6 +1549,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             continue;
         };
         let t1 = now_unix_ms();
+        let diagnostic_received = crate::diagnostics::clock();
         if let Ok(request) = serde_json::from_slice::<api::ApiRequest>(&message.data)
             && api::OPS.contains(&request.op.as_str())
         {
@@ -1610,7 +1611,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "ping" => {
                 state.record_clock(request.offset_ms, request.rtt_ms);
-                ok(&request.id, json!({"t0": request.t0, "t1": t1, "t2": now_unix_ms()}))
+                ok(
+                    &request.id,
+                    json!({"t0": request.t0, "t1": t1, "t2": now_unix_ms(),"diagnosticClock":{"received_ns":diagnostic_received.0,"sent_ns":crate::diagnostics::clock().0,"clock_domain":diagnostic_received.1}}),
+                )
             }
             "stats" => {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});

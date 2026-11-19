@@ -88,6 +88,9 @@ fn age_ms(sent_at_ms: f64, offset_ms: f64, gateway_now_ms: f64) -> f64 {
 
 /// A message waiting for the put ahead of it, and when it is no longer worth putting.
 struct Waiting {
+    attachment: Option<Vec<u8>>,
+    context: Option<serde_json::Value>,
+    received: Instant,
     payload: Vec<u8>,
     expires: Instant,
 }
@@ -234,7 +237,27 @@ pub async fn run(
             }
             let publisher = publisher.clone();
             let left = next.expires - now;
-            putting = Some(Box::pin(async move { tokio::time::timeout(left, publisher.put(next.payload)).await.ok() }));
+            putting = Some(Box::pin(async move {
+                crate::diagnostics::event(
+                    "queue.delay",
+                    next.context.as_ref(),
+                    serde_json::json!({"queue":"gateway.command", "duration_ns":next.received.elapsed().as_nanos() as u64}),
+                );
+                let _span = crate::diagnostics::Span::new(
+                    "gateway.zenoh_put",
+                    next.context.clone(),
+                    serde_json::json!({"channel":publisher.key_expr().as_str()}),
+                );
+                let put = publisher.put(next.payload);
+                let put = if let Some(attachment) = next.attachment { put.attachment(attachment) } else { put };
+                let result = tokio::time::timeout(left, put).await.ok();
+                crate::diagnostics::event(
+                    "gateway.command_dispatch",
+                    next.context.as_ref(),
+                    serde_json::json!({"result":if matches!(&result, Some(Ok(()))) {"published"} else {"failed"},"hardware_acknowledged":false}),
+                );
+                result
+            }));
         }
         let event = tokio::select! {
             event = dc.poll() => event,
@@ -250,11 +273,28 @@ pub async fn run(
                     let stamp = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
                     shared.received_at(stamp, Instant::now(), now_unix_ms());
                 }
-                if !admission.admit(&dc, &shared, &blocker).await {
-                    continue;
-                }
                 if message.data.len() < PUT_HEADER_LEN {
                     shared.stats.lock().malformed += 1;
+                    continue;
+                }
+                let (context, attachment, payload) = if opts.trace_schema.is_some() {
+                    match crate::diagnostics::unwrap_put(&message.data[PUT_HEADER_LEN..]) {
+                        Ok((context, attachment, payload)) => (Some(context), Some(attachment), payload),
+                        Err(_) => {
+                            shared.stats.lock().malformed += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    (None, None, message.data[PUT_HEADER_LEN..].to_vec())
+                };
+                crate::diagnostics::event("gateway.command_received", context.as_ref(), serde_json::json!({"channel":label.key}));
+                if !admission.admit(&dc, &shared, &blocker).await {
+                    crate::diagnostics::event(
+                        "gateway.command_rejected",
+                        context.as_ref(),
+                        serde_json::json!({"channel":label.key,"reason":admission.blocked.as_deref().unwrap_or("deadman_tripped")}),
+                    );
                     continue;
                 }
                 let sent_at_ms = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
@@ -272,10 +312,15 @@ pub async fn run(
                 let mut stats = shared.stats.lock();
                 stats.last_accepted_sent_at_ms = Some(sent_at_ms);
                 // latest: a newer message replaces one still waiting
-                if !reliable && waiting.pop_back().is_some() {
+                if !reliable && let Some(old) = waiting.pop_back() {
                     stats.dropped_stale += 1;
+                    crate::diagnostics::event(
+                        "queue.discard",
+                        old.context.as_ref(),
+                        serde_json::json!({"queue":"gateway.command","reason":"superseded"}),
+                    );
                 }
-                waiting.push_back(Waiting { payload: message.data[PUT_HEADER_LEN..].to_vec(), expires: Instant::now() + worth });
+                waiting.push_back(Waiting { payload, attachment, context, received: Instant::now(), expires: Instant::now() + worth });
             }
             Some(DataChannelEvent::OnClose) | None => break,
             Some(_) => {}
@@ -289,7 +334,12 @@ pub async fn run(
         count(
             &shared,
             &label.key,
-            tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await.ok(),
+            tokio::time::timeout(
+                next.expires.saturating_duration_since(Instant::now()),
+                publisher.put(next.payload).attachment(next.attachment.unwrap_or_default()),
+            )
+            .await
+            .ok(),
         );
     }
     debug!("publisher {:?} closed", label.key);

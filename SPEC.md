@@ -822,4 +822,10 @@ resolving so the gateway has an offset before the first put.
   its sample and finished encoding it (unix ms, gateway clock); the frame header's timestamp is the sample's own.
   With flags bit2 (0.5.31+) the picture's message header follows: `f64 stamp (seconds) | u16 frameIdLength | frameId
   (UTF-8)` (`msg.video.stamp`, `msg.video.frameId`; set by an encoding with `VideoImage::with_header`), so a page places
-  each picture in its own TF frame; readers of the first 64 bytes ignore it. A fields message is "Fields", any other data-channel encoding's its own format.
+  each picture in its own TF frame; readers of the first 64 bytes ignore it.
+  With flags bit3 and no bit2, offset 64 carries `u16 encodingLen | encoding UTF-8 |
+  u32 attachmentLen | attachment`; this preserves trace identity for codecs without a
+  message header. It does not invent a camera timestamp or TF frame. Readers that do
+  not support this extension ignore bytes after the fixed header. With bit2, metadata
+  remains in the existing extended message-header encoding; bit3 is not also set.
+  A fields message is "Fields", any other data-channel encoding's its own format.

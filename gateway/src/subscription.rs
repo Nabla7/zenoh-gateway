@@ -765,6 +765,11 @@ impl SubShared {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
+        crate::diagnostics::event(
+            "transport.received",
+            crate::diagnostics::context(sample.attachment().map(|a| a.to_bytes()).as_deref()).as_ref(),
+            serde_json::json!({"channel":sample.key_expr().as_str(),"transport":"Zenoh"}),
+        );
         let payload_len = sample.payload().len();
         {
             let mut state = self.state.lock();
@@ -939,6 +944,11 @@ impl SubShared {
         };
         queue.last_taken = Some(now);
         state.stats.unqueue(&item);
+        crate::diagnostics::event(
+            "queue.delay",
+            crate::diagnostics::context(item.attachment.as_ref().map(|a| a.to_bytes()).as_deref()).as_ref(),
+            serde_json::json!({"channel":key,"queue":"gateway.subscription","duration_ns":item.arrived.elapsed().as_nanos() as u64}),
+        );
         (Some((key, Some(item))), wake_at)
     }
 

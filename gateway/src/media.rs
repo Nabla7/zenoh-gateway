@@ -85,6 +85,8 @@ pub const METADATA_FLAG_RTP: u8 = 2;
 /// metadata flag: the frame's message header follows byte 64 ([`frame::encode_header`](crate::frame::encode_header): 0.5.31 sent
 /// `f64 stamp | u16 frameIdLength | frameId`, 0.5.32+ adds `i32 sec | u32 nanosec | u8 hasSeq | u32 seq`)
 pub const METADATA_FLAG_HEADER: u8 = 4;
+/// Trace attachment when the codec supplies no message header.
+pub const METADATA_FLAG_ATTACHMENT: u8 = 8;
 
 /// The track format of a payload type the gateway (and the Rust client) offers.
 #[cfg(feature = "client")]
@@ -1161,7 +1163,9 @@ pub fn start_decode(
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec, channel) =
         (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
+    let diagnostic_context = crate::diagnostics::context(item.attachment.as_ref().map(|a| a.to_bytes()).as_deref());
     let task = tokio::task::spawn_blocking(move || {
+        let _span = crate::diagnostics::Span::new("gateway.video_decode", diagnostic_context, serde_json::json!({"channel":hash_key}));
         let started = Instant::now();
         let sample = EncodingSample::new(&hash_key, &payload, &encoding);
         let hash = registry::sample_hash(&sample);
@@ -1806,7 +1810,9 @@ async fn step(
         // (made on the blocking pool too: a hardware encoder's setup can block)
         let (existing, format, timeout) = (state.encoder.take(), session.format, codecs.encode_timeout);
         let decoded = input.decoded.clone();
+        let diagnostic_context = crate::diagnostics::sample_context(&input.sample);
         let encoding = tokio::task::spawn_blocking(move || {
+            let _span = crate::diagnostics::Span::new("gateway.video_encode", diagnostic_context, serde_json::json!({}));
             let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
             // this frame's output (or an earlier one's)
@@ -2224,8 +2230,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 break;
             }
             let stage = Instant::now();
+            let write_span = crate::diagnostics::Span::new(
+                "gateway.video_track_write",
+                crate::diagnostics::sample_context(&logged.sample),
+                serde_json::json!({"track":track.mid}),
+            );
             let writing =
                 track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await;
+            drop(write_span);
             profile.write += stage.elapsed();
             let written = match writing {
                 Ok(written) => written,
@@ -2238,6 +2250,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                     continue;
                 }
             };
+            crate::diagnostics::event(
+                "video.rtp_frame",
+                crate::diagnostics::sample_context(&logged.sample).as_ref(),
+                serde_json::json!({"track":track.mid,"generation":member.id,"rtp_timestamp":written.rtp_timestamp,
+                    "ssrc":track.ssrc,"pacer":track.rate.pacer.diagnostic_id()}),
+            );
             let times = FrameTimes {
                 received_ms: logged.received_ms,
                 encoded_ms: logged.encoded_ms,
@@ -2249,7 +2267,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 times.written_ms - times.encoded_ms,
                 track.pacer_delay_percentiles(),
             );
-            let meta = metadata(
+            let mut meta = metadata(
                 frame,
                 logged.source,
                 quality,
@@ -2257,6 +2275,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 times,
                 logged.header.as_ref().filter(|_| shared.sends_header()).map(|header| (header, &logged.sample)),
             );
+            // Trace identity belongs to the source sample, including codecs with
+            // no ROS-style header and viewers that did not request that header.
+            // Bit 3 carries metadata alone; old clients ignore this extension.
+            if meta[1] & 4 == 0 && crate::diagnostics::sample_context(&logged.sample).is_some() {
+                if let Some((encoding, attachment)) = &logged.sample {
+                    meta[1] |= METADATA_FLAG_ATTACHMENT;
+                    meta.extend(crate::frame::encode_meta(encoding, attachment.as_deref(), &[]));
+                }
+            }
             let shared_encode = logged.encoded_by != member.id;
             shared.record_video_frame(
                 frame.data.len(),

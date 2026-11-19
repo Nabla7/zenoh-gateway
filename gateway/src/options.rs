@@ -72,6 +72,8 @@ pub struct SubOpts {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PubOpts {
+    /// Opt-in framing; unknown versions are refused before channel acceptance.
+    pub trace_schema: Option<String>,
     #[serde(default)]
     pub delivery: DeliveryKind,
     pub priority: Option<u8>,
@@ -289,6 +291,9 @@ impl SubOpts {
 impl PubOpts {
     pub fn parse(opts: &Value) -> Result<Self, String> {
         let parsed: PubOpts = serde_json::from_value(opts.clone()).map_err(|e| e.to_string())?;
+        if parsed.trace_schema.as_deref().is_some_and(|v| v != crate::diagnostics::SCHEMA) {
+            return Err("unsupported diagnostic framing".into());
+        }
         check_priority(parsed.priority)?;
         check_positive("latencyLimit", parsed.latency_limit)?;
         if let Some(rate) = parsed.sample_rate

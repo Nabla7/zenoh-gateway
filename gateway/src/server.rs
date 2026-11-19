@@ -636,6 +636,7 @@ impl Server {
             task.abort();
         }
         self.inner.gateway.shutdown().await;
+        let _ = tokio::task::spawn_blocking(crate::diagnostics::flush).await;
         if self.inner.owns_session {
             let timeout = self.inner.gateway.signalling_timeout();
             tokio::time::timeout(timeout, self.inner.session.close())

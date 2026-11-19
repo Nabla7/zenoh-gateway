@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 /// The rate before the congestion controller's first target (rtc-interceptor's default).
 const INITIAL_BPS: f64 = 1_000_000.0;
+static NEXT_DIAGNOSTIC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 /// Dropped packets remembered, so their retransmissions are dropped too.
 const DROPPED_MEMORY: usize = 4096;
 
@@ -38,6 +39,7 @@ pub struct PacerShared {
     /// each video track's latest keyframe by RTP timestamp (`None`: its first frame, whose timestamp isn't known yet)
     keyframes: Mutex<HashMap<u32, Option<u32>>>,
     dropped_packets: std::sync::atomic::AtomicU64,
+    diagnostic_id: u64,
 }
 
 impl Default for PacerShared {
@@ -49,11 +51,16 @@ impl Default for PacerShared {
             keyframe_flags: Default::default(),
             keyframes: Default::default(),
             dropped_packets: Default::default(),
+            diagnostic_id: NEXT_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
 
 impl PacerShared {
+    /// Process-scoped incarnation, stable across a track's packets.
+    pub fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id
+    }
     /// The connection's latency target: how long a frame may wait past its own time to leave.
     pub fn set_queue_limit(&self, limit: Duration) {
         *self.queue_limit.lock() = limit;
@@ -180,6 +187,16 @@ impl AgedPacer {
     }
 
     fn drop_packet(&mut self, queued: Queued) {
+        if crate::diagnostics::enabled() {
+            crate::diagnostics::event(
+                "video.pacer_drop",
+                None,
+                serde_json::json!({
+                "pacer":self.shared.diagnostic_id(),"ssrc":queued.frame.0,"rtp_timestamp":queued.frame.1,
+                "duration_ns":queued.since.elapsed().as_nanos() as u64,"outcome":"dropped",
+                "reason":"queue_age_or_keyframe_supersession"}),
+            );
+        }
         self.dequeued(&queued);
         self.shared.dropped_packets.fetch_add(1, Ordering::Relaxed);
         if let Packet::Rtp(rtp) = &queued.packet.message.packet {
@@ -292,6 +309,16 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
             }
             let queued = self.queue.pop_front().expect("front just checked");
             self.bucket.consume(queued.bits);
+            if crate::diagnostics::enabled() && matches!(&queued.packet.message.packet, Packet::Rtp(rtp) if rtp.header.marker) {
+                crate::diagnostics::event(
+                    "video.pacer_departure",
+                    None,
+                    serde_json::json!({
+                    "pacer":self.shared.diagnostic_id(),"ssrc":queued.frame.0,"rtp_timestamp":queued.frame.1,
+                    "duration_ns":now.saturating_duration_since(queued.since).as_nanos() as u64,
+                    "scope":"marker packet leaves application pacer; not NIC or over-air transmit"}),
+                );
+            }
             self.dequeued(&queued);
             let mut packet = queued.packet;
             // it departs now: the send history after this must see the release instant, not the enqueue one

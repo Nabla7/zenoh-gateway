@@ -184,6 +184,9 @@ pub struct LeaseOptions {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublisherOptions {
+    /// Opt-in trace contract. Use `put_traced`; older gateways reject setup explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_schema: Option<String>,
     /// default latest
     pub delivery: Option<Delivery>,
     /// zenoh priority 1..7
@@ -1024,7 +1027,16 @@ impl Client {
         let repeat = options
             .repeat_ms
             .map(|ms| tokio::spawn(repeat_puts(channel.clone(), state.clone(), delivery, Duration::from_millis(ms.max(1)))));
-        Ok(Publisher { key: key.to_owned(), id, channel, state, delivery, repeat, client: Arc::downgrade(inner) })
+        Ok(Publisher {
+            key: key.to_owned(),
+            id,
+            channel,
+            state,
+            delivery,
+            repeat,
+            traced: options.trace_schema.is_some(),
+            client: Arc::downgrade(inner),
+        })
     }
 
     /// Takes (or renews) the exclusive right to publish on `group`'s keys among the gateway's clients: the
@@ -1410,7 +1422,13 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
                 Some((header, sample)) => (Some(header), sample),
                 None => (None, None),
             };
-            let (encoding, attachment) = sample.unzip();
+            let (encoding, attachment) = if bytes[1] & media::METADATA_FLAG_ATTACHMENT != 0 && bytes[1] & media::METADATA_FLAG_HEADER == 0 {
+                let tail = bytes.get(media::METADATA_LEN..).context("missing video metadata attachment")?;
+                let (encoding, attachment, _) = frame::decode_meta(tail).context("bad video metadata attachment")?;
+                (Some(encoding.to_owned()), Some((!attachment.is_empty()).then(|| attachment.to_vec())))
+            } else {
+                sample.unzip()
+            };
             Some(Message::VideoInfo(VideoFrameInfo {
                 key,
                 timestamp_ms,
@@ -1654,6 +1672,7 @@ pub struct Publisher {
     channel: Arc<dyn DataChannel>,
     state: Arc<PubState>,
     delivery: Delivery,
+    traced: bool,
     repeat: Option<tokio::task::JoinHandle<()>>,
     client: Weak<Inner>,
 }
@@ -1704,11 +1723,28 @@ impl Publisher {
 
     /// Puts `bytes` produced at `timestamp_ms` (unix ms, this client's clock), for `latencyLimit`.
     pub async fn put_at(&self, bytes: impl AsRef<[u8]>, timestamp_ms: f64) -> Result<()> {
+        ensure!(!self.traced, "negotiated traced publisher requires put_traced");
+        self.send(bytes.as_ref(), timestamp_ms).await
+    }
+
+    /// Publishes original bytes with identity on a negotiated traced channel.
+    pub async fn put_traced(&self, bytes: impl AsRef<[u8]>, context: &serde_json::Value) -> Result<()> {
+        ensure!(self.traced, "put_traced requires trace_schema at setup");
+        let mut attachment = b"DIMOS_TRACE_V1\0".to_vec();
+        attachment.extend(serde_json::to_vec(context)?);
+        ensure!(crate::diagnostics::context(Some(&attachment)).is_some(), "invalid trace context");
+        let mut frame = (attachment.len() as u32).to_le_bytes().to_vec();
+        frame.extend(attachment);
+        frame.extend(bytes.as_ref());
+        self.send(&frame, now_ms()).await
+    }
+
+    async fn send(&self, bytes: &[u8], timestamp_ms: f64) -> Result<()> {
         self.check()?;
         if self.repeat.is_some() {
-            *self.state.last.lock() = Some(bytes.as_ref().to_vec());
+            *self.state.last.lock() = Some(bytes.to_vec());
         }
-        send_put(&self.channel, self.delivery, bytes.as_ref(), timestamp_ms).await
+        send_put(&self.channel, self.delivery, bytes, timestamp_ms).await
     }
 
     /// Stores `bytes` on the gateway, published once (REAL_TIME, reliable) if this client's heartbeat

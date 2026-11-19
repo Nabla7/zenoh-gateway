@@ -5087,6 +5087,7 @@ dependencies = [
  "dhat",
  "futures",
  "hmac",
+ "libc",
  "log",
  "openh264",
  "openh264-sys2",

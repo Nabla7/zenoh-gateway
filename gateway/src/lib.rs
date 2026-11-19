@@ -126,3 +126,8 @@ mod tests {
         assert!(unused_rx.await.is_err(), "on_panic ran for a task that didn't panic");
     }
 }
+
+/// Shared opt-in diagnostic event contract.
+pub mod diagnostics;
+
+mod trace_ring;

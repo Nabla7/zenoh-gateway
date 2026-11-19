@@ -20,6 +20,19 @@ use zenoh_gateway::{
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
 
+struct BareSolidColor;
+impl MessageEncoding for BareSolidColor {
+    fn name(&self) -> &str {
+        "test-bare-solid"
+    }
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        Ok(DecodedFrame::Video(VideoImage::rgb8(160, 120, sample.payload[..3].repeat(160 * 120))?))
+    }
+}
+
 impl MessageEncoding for SolidColor {
     fn name(&self) -> &str {
         "test-solid"
@@ -73,10 +86,101 @@ fn isolated_config() -> zenoh::Config {
 
 async fn start() -> (RunningServer, zenoh::Session, String) {
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session.clone()).encoding(SolidColor).encoding(ByteFields).build().await.unwrap();
+    let server = Server::builder()
+        .session(session.clone())
+        .encoding(SolidColor)
+        .encoding(BareSolidColor)
+        .encoding(ByteFields)
+        .build()
+        .await
+        .unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     (running, session, url)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_command_identity_crosses_real_webrtc_and_rejects_mismatches() {
+    let (running, session, url) = start().await;
+    let receiver = session.declare_subscriber("diagnostics/control").await.unwrap();
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let wrong = PublisherOptions { trace_schema: Some("unsupported/v99".into()), ..Default::default() };
+    assert!(client.publish("diagnostics/control", wrong).await.is_err());
+    let publisher = client
+        .publish(
+            "diagnostics/control",
+            PublisherOptions { trace_schema: Some("dimos.trace/v1".into()), delivery: Some(Delivery::Reliable), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let context = json!({"schema":"dimos.trace/v1","run_id":"test","publisher":"operator","stream":"hand","sequence":7,
+        "origin_ns":100,"clock_domain":"test/clock","parents":[],"lineage":"complete"});
+    assert!(publisher.put(b"unwrapped").await.is_err());
+    publisher.put_traced([0, 255, 0, 128], &context).await.unwrap();
+    let sample = timeout(Duration::from_secs(5), receiver.recv_async()).await.unwrap().unwrap();
+    assert_eq!(sample.payload().to_bytes().as_ref(), &[0, 255, 0, 128]);
+    assert_eq!(zenoh_gateway::diagnostics::context(sample.attachment().map(|a| a.to_bytes()).as_deref()), Some(context));
+    drop(publisher);
+    client.close().await;
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_video_identity_matches_encoded_rtp_frame() {
+    diagnostic_video_identity("test-solid").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_video_identity_survives_a_codec_without_message_headers() {
+    diagnostic_video_identity("test-bare-solid").await;
+}
+
+async fn diagnostic_video_identity(encoding: &str) {
+    let (running, session, url) = start().await;
+    let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
+    let mut camera =
+        client.subscribe("diagnostics/camera", SubscribeOptions { encoding: Some(encoding.into()), ..Default::default() }).await.unwrap();
+    let context = json!({"schema":"dimos.trace/v1","run_id":"test","publisher":"sensor","stream":"camera","sequence":3,
+        "origin_ns":100,"clock_domain":"test/clock","parents":[],"lineage":"complete"});
+    let mut attachment = b"DIMOS_TRACE_V1\0".to_vec();
+    attachment.extend(serde_json::to_vec(&context).unwrap());
+    let putter = keep_putting_attached(
+        &session,
+        "diagnostics/camera",
+        solid([30, 60, 90], 160, 120),
+        "application/octet-stream",
+        attachment.clone(),
+    );
+    let mut frames = std::collections::HashSet::new();
+    let mut infos = std::collections::HashMap::new();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match camera.recv().await.unwrap() {
+                Message::Video(frame) => {
+                    frames.insert(frame.rtp_timestamp);
+                }
+                // The initial packet may still be in the pacer when the first metadata
+                // goes out. Require an actual later match; never substitute a timestamp.
+                Message::VideoInfo(info) => {
+                    if let Some(timestamp) = info.rtp_timestamp {
+                        infos.insert(timestamp, info);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(timestamp) = frames.iter().find(|timestamp| infos.contains_key(timestamp)) {
+                assert_eq!(infos[timestamp].attachment.as_deref(), Some(attachment.as_slice()));
+                assert_eq!(infos[timestamp].stamp.is_some(), encoding == "test-solid");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    putter.abort();
+    let _ = putter.await;
+    client.close().await;
+    running.shutdown().await.unwrap();
 }
 
 /// Puts `payload` on `key` every 50 ms until dropped (the gateway's subscription starts a moment after it accepts).
