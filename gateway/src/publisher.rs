@@ -32,6 +32,13 @@ pub struct PubStats {
     /// dropped because another client leases the key
     pub rejected_leased: u64,
     pub last_age_ms: Option<f64>,
+    pub last_received_sent_at_ms: Option<f64>,
+    pub last_received_at_ms: Option<f64>,
+    pub last_accepted_sent_at_ms: Option<f64>,
+    pub max_receive_gap_ms: f64,
+    pub receive_gaps_over_100_ms: u64,
+    pub max_source_gap_ms: f64,
+    pub max_age_ms: f64,
     pub deadman_armed: bool,
     pub tripped: bool,
 }
@@ -39,11 +46,29 @@ pub struct PubStats {
 #[derive(Default)]
 pub struct PubShared {
     pub stats: Mutex<PubStats>,
+    last_arrival: Mutex<Option<Instant>>,
     /// Set once this stream's deadman fired; every later put is rejected.
     pub tripped: AtomicBool,
 }
 
 impl PubShared {
+    fn received_at(&self, sent_at_ms: f64, now: Instant, wall_ms: f64) {
+        let mut stats = self.stats.lock();
+        let mut arrival = self.last_arrival.lock();
+        if let Some(previous) = arrival.replace(now) {
+            let gap = now.saturating_duration_since(previous).as_secs_f64() * 1000.0;
+            stats.max_receive_gap_ms = stats.max_receive_gap_ms.max(gap);
+            stats.receive_gaps_over_100_ms += u64::from(gap > 100.0);
+        }
+        if sent_at_ms.is_finite() {
+            if let Some(previous) = stats.last_received_sent_at_ms {
+                stats.max_source_gap_ms = stats.max_source_gap_ms.max(sent_at_ms - previous);
+            }
+            stats.last_received_sent_at_ms = Some(sent_at_ms);
+        }
+        stats.last_received_at_ms = Some(wall_ms);
+    }
+
     pub fn snapshot(&self) -> PubStats {
         let mut stats = self.stats.lock().clone();
         stats.tripped = self.tripped.load(Ordering::Acquire);
@@ -140,6 +165,7 @@ fn age(shared: &PubShared, sent_at_ms: Option<f64>, clock_offset_ms: &Mutex<Opti
     };
     let age = age_ms(sent_at_ms, offset_ms, now_unix_ms());
     stats.last_age_ms = Some(age);
+    stats.max_age_ms = stats.max_age_ms.max(age);
     Some(age)
 }
 
@@ -220,6 +246,10 @@ pub async fn run(
         };
         match event {
             Some(DataChannelEvent::OnMessage(message)) => {
+                if message.data.len() >= PUT_HEADER_LEN {
+                    let stamp = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
+                    shared.received_at(stamp, Instant::now(), now_unix_ms());
+                }
                 if !admission.admit(&dc, &shared, &blocker).await {
                     continue;
                 }
@@ -240,6 +270,7 @@ pub async fn run(
                     None => limit.unwrap_or(put_timeout),
                 };
                 let mut stats = shared.stats.lock();
+                stats.last_accepted_sent_at_ms = Some(sent_at_ms);
                 // latest: a newer message replaces one still waiting
                 if !reliable && waiting.pop_back().is_some() {
                     stats.dropped_stale += 1;

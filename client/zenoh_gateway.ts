@@ -1213,6 +1213,11 @@ export class Subscription extends Endpoint {
 }
 
 export class Publisher extends Endpoint {
+    /** Diagnostic clock stamps: actual channel sends, separate from application put attempts. */
+    lastSentAtMs: number | null = null
+    maxSendGapMs = 0
+    attempted = 0
+    lastAttemptAtMs: number | null = null
     sent = 0
     dropped = 0
     tripped = false
@@ -1262,7 +1267,7 @@ export class Publisher extends Endpoint {
         const { delivery, priority, latencyLimit } = this.options
         const label = JSON.stringify({ type: "pub", key: this.key, id: this.id, opts: { delivery, priority, latencyLimit } })
         const acceptance = this.beginAttempt()
-        const channel = peer.createDataChannel(label, channelInit(delivery, undefined, isStrict(priority)))
+        const channel = peer.createDataChannel(label, channelInit(delivery, latencyLimit, isStrict(priority)))
         channel.binaryType = "arraybuffer"
         channel.bufferedAmountLowThreshold = resumeBytes
         channel.onbufferedamountlow = () => this.#flush()
@@ -1294,6 +1299,8 @@ export class Publisher extends Endpoint {
     }
 
     put(value: Bytesish, { timestamp }: { timestamp?: number } = {}): void {
+        this.attempted++
+        this.lastAttemptAtMs = this.owner.now()
         this.#checkUsable()
         const bytes = toBytes(value)
         this.#last = bytes
@@ -1312,7 +1319,14 @@ export class Publisher extends Endpoint {
             this.#dropStale()
             return
         }
-        channel.send(frame)
+        this.#transmit(channel, frame)
+    }
+
+    #transmit(channel: RTCDataChannel, frame: Uint8Array) {
+        channel.send(frame as Uint8Array<ArrayBuffer>)
+        const stamp = new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getFloat64(0, true)
+        if (this.lastSentAtMs !== null) this.maxSendGapMs = Math.max(this.maxSendGapMs, stamp - this.lastSentAtMs)
+        this.lastSentAtMs = stamp
         this.sent++
     }
 
@@ -1329,8 +1343,7 @@ export class Publisher extends Endpoint {
         const channel = this.channel
         this.#dropStale()
         while (this.#pending.length > 0 && channel?.readyState === "open" && this.rejectionReason === null && channel.bufferedAmount <= backedUpBytes) {
-            channel.send(this.#pending.shift()!.frame)
-            this.sent++
+            this.#transmit(channel, this.#pending.shift()!.frame)
         }
     }
 
@@ -2274,7 +2287,7 @@ export class ZenohGateway {
         const share = response && budget > 0 ? (JSON.stringify(response).length / (statsBudgetShare * budget)) * 1000 : 0
         this.#statsDueAt = performance.now() + (response ? Math.min(maxStatsIntervalMs, share) : maxStatsIntervalMs)
         if (response) {
-            this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null } as GatewayStats
+            this.gatewayStats = { clock: response.clock, heartbeat: response.heartbeat, bandwidth: response.bandwidth ?? null, selectedPath: response.selectedPath ?? null } as GatewayStats
             this.#updateCongestion((response.bandwidth ?? null) as Record<string, unknown> | null, (response.channels as GatewayChannelStats[] | undefined) ?? [])
         }
         this.#refreshStats((response?.channels as GatewayChannelStats[] | undefined) ?? null)

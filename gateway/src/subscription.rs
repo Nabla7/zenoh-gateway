@@ -155,6 +155,8 @@ struct KeyQueue {
     /// when the next sample may go: one interval on from the last one's due time, not from when it went (libwebrtc's
     /// FramerateController: spacing from send times held a 20 Hz camera granted 20 Hz to 12.6, each frame a hair early)
     next_due: Option<Instant>,
+    /// The interval used to set `next_due`; a recovered grant must replace a low-rate deadline.
+    scheduled_interval: Option<Duration>,
     /// arrivals since the allocator last looked, and the resulting source rate
     arrivals: u32,
     /// samples ever pushed for this key, which `arrivals` cannot say since the allocator resets it. It numbers them for
@@ -495,7 +497,8 @@ impl SubShared {
         // granted nothing
         let lift = probing && !self.on_track();
         match self.allocated_key_hz(queue.rate_hz, allocation).filter(|hz| !(lift && *hz > 0.0)) {
-            Some(hz) if hz <= 0.0 => Spacing::Never,
+            // Floating-point allocation residue is a zero grant, not a frame scheduled days away.
+            Some(hz) if hz <= 1e-9 => Spacing::Never,
             Some(hz) => Spacing::Every(crate::secs(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
             // a stream decoder has to see **every** sample, so its key is not spaced at all: `maxHz` limits what is
             // encoded and sent, not what the decoder is fed (the send loop encodes one picture an interval and decodes
@@ -872,11 +875,23 @@ impl SubShared {
         }
         let mut best: Option<(&String, (u8, Instant))> = None;
         let mut wake_at: Option<Instant> = None;
-        for (key, queue) in state.keys.iter() {
+        for (key, queue) in state.keys.iter_mut() {
+            let spacing = self.key_interval(queue, &state.allocation, state.probing);
+            let interval = match spacing {
+                Spacing::Every(interval) => Some(interval),
+                _ => None,
+            };
+            if interval != queue.scheduled_interval {
+                // Anchor to the last take, never to each wakeup: repeated budget updates must not
+                // push the deadline ahead forever. Checking here also covers retuning and source-rate
+                // changes, while an unchanged rate keeps the existing jitter-tolerant video schedule.
+                queue.next_due = interval.and_then(|interval| queue.last_taken.map(|taken| taken + interval));
+                queue.scheduled_interval = interval;
+            }
             let Some(head) = queue.items.front() else {
                 continue;
             };
-            match (self.key_interval(queue, &state.allocation, state.probing), queue.next_due) {
+            match (spacing, queue.next_due) {
                 (Spacing::Never, _) => continue,
                 (Spacing::Every(_), Some(due)) if due > now => {
                     wake_at = Some(wake_at.map_or(due, |w| w.min(due)));
@@ -1635,6 +1650,73 @@ mod tests {
             })
             .count();
         assert!(sent >= 97, "{sent} of 100 frames went");
+    }
+
+    #[test]
+    fn recovered_camera_grants_replace_old_deadlines() {
+        for low_hz in [0.01, 1e-8] {
+            let shared = video_shared(Channel::Video(crate::encoding::video::VideoFormat::H264));
+            shared.state.lock().keys.entry("cam".into()).or_default().rate_hz = 15.0;
+            let grant = |hz| Allocation { constrained: true, hz, hz_fraction: hz / 15.0, ..Default::default() };
+            let t0 = Instant::now();
+            shared.apply(grant(low_hz), false);
+            insert(&shared, "cam", pending(0, 5, t0), Some(1));
+            assert!(shared.pick(t0).0.is_some());
+
+            shared.apply(grant(2.0), false);
+            let now = t0 + Duration::from_secs(1);
+            insert(&shared, "cam", pending(1, 5, now), Some(1));
+            assert!(shared.pick(now).0.is_some(), "recovery from {low_hz} Hz must send a fresh frame");
+            assert!(shared.pick(now).0.is_none(), "recovery must not replay a backlog");
+        }
+    }
+
+    #[test]
+    fn zero_and_roundoff_camera_grants_pause_then_recover() {
+        for low_hz in [0.0, 3.789561257387201e-15] {
+            let shared = video_shared(Channel::Video(crate::encoding::video::VideoFormat::H264));
+            shared.state.lock().keys.entry("cam".into()).or_default().rate_hz = 15.0;
+            let grant = |hz| Allocation { constrained: true, hz, hz_fraction: hz / 15.0, ..Default::default() };
+            let t0 = Instant::now();
+            shared.apply(grant(low_hz), false);
+            insert(&shared, "cam", pending(0, 5, t0), Some(1));
+            assert!(shared.pick(t0).0.is_none(), "a zero grant sends nothing");
+            shared.apply(grant(2.0), false);
+            let now = t0 + Duration::from_secs(1);
+            insert(&shared, "cam", pending(1, 5, now), Some(1));
+            assert_eq!(shared.pick(now).0.unwrap().1.seq, 1, "recovery sends the latest frame");
+        }
+    }
+
+    #[test]
+    fn repeated_allocations_do_not_postpone_sends_and_lower_grants_still_throttle() {
+        let shared = shared(r#"{}"#);
+        shared.state.lock().keys.entry("cam".into()).or_default().rate_hz = 20.0;
+        let grant = |hz| Allocation { constrained: true, hz, hz_fraction: hz / 20.0, ..Default::default() };
+        let t0 = Instant::now();
+        shared.apply(grant(20.0), false);
+        insert(&shared, "cam", pending(0, 5, t0), Some(1));
+        assert!(shared.pick(t0).0.is_some());
+        for millis in [100, 200, 300, 400] {
+            let now = t0 + Duration::from_millis(millis);
+            shared.apply(grant(2.0), false);
+            insert(&shared, "cam", pending(1, 5, now), Some(1));
+            assert!(shared.pick(now).0.is_none());
+        }
+        shared.apply(grant(2.0), false);
+        assert!(shared.pick(t0 + Duration::from_millis(500)).0.is_some());
+    }
+
+    #[test]
+    fn retuning_max_hz_recovers_a_pending_frame() {
+        let shared = shared(r#"{"maxHz":0.01}"#);
+        let t0 = Instant::now();
+        insert(&shared, "cam", pending(0, 5, t0), Some(1));
+        assert!(shared.pick(t0).0.is_some());
+        shared.retune(&SubOpts::parse(&serde_json::json!({"maxHz": 10})).unwrap());
+        let now = t0 + Duration::from_millis(100);
+        insert(&shared, "cam", pending(1, 5, now), Some(1));
+        assert!(shared.pick(now).0.is_some());
     }
 
     #[test]

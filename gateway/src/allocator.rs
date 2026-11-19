@@ -99,6 +99,11 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
             let step = active.iter().map(|&i| grants[i] * total / weight(i)).fold(over, f64::min);
             for &i in &active {
                 grants[i] = (grants[i] - step * weight(i) / total).max(0.0);
+                // The exhausted-stream threshold below must also zero its grant; otherwise a tiny
+                // positive subtraction residue becomes a nonzero frame rate in `split`.
+                if grants[i] <= 1e-9 {
+                    grants[i] = 0.0;
+                }
             }
             over -= step;
             active.retain(|&i| grants[i] > 1e-9);
@@ -624,6 +629,16 @@ mod tests {
             price: Box::new(|q| 100.0 + 1000.0 * q),
             fixed_bytes_per_sec: None,
             shrinks_last: false,
+        }
+    }
+
+    #[test]
+    fn exhausted_grants_are_exactly_zero() {
+        // Uneven floating-point demands used to leave positive subtraction residue at zero budget.
+        let demands = [raw(10.0, 14.9, 3832.583813968), raw(10.0, 15.1, 3911.681717509), transcoded(1.0, 30.3)];
+        for allocation in allocate(0.0, &demands) {
+            assert_eq!(allocation.budget_bytes_per_sec, 0.0);
+            assert_eq!(allocation.hz, 0.0);
         }
     }
 

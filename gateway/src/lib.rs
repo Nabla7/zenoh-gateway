@@ -59,6 +59,7 @@ mod publisher;
 mod rtp_pacer;
 mod server;
 mod subscription;
+mod video_brake;
 
 pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
 /// The built-in AV1 encoder (feature `av1`), beside [`H264Encoder`], for an encoding that supplies its own.
