@@ -45,14 +45,6 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const ALLOCATION_INTERVAL: Duration = Duration::from_millis(250);
 /// The longest `resumeLink` id kept (a page's own random id; anything longer is refused, not stored).
 const MAX_LINK_ID_LEN: usize = 128;
-/// Video's queue brake (see `PeerState::video_cap`): cuts at most this often, after the queue was high this many rounds
-/// in a row, from the most video delivered over this long.
-const VIDEO_BRAKE_SPACING: Duration = Duration::from_millis(500);
-const VIDEO_QUEUE_ROUNDS: u32 = 2;
-const VIDEO_DELIVERY_WINDOW: Duration = Duration::from_secs(2);
-/// What a brake keeps of that most: libwebrtc's AimdRateControl backs off to 85 % of what was delivered.
-const VIDEO_BRAKE_BACKOFF: f64 = 0.85;
-
 /// Gateway-wide allocation settings (builder options / command-line flags).
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationConfig {
@@ -121,6 +113,11 @@ struct BandwidthStats {
     pacer_delay_ms: f64,
     pacer_dropped_packets: u64,
     video_brake_bytes_per_sec: Option<f64>,
+    video_brake_reason: &'static str,
+    video_application_limited: bool,
+    video_gcc_cap_bytes_per_sec: Option<f64>,
+    video_least_queue_ms: Option<f64>,
+    video_delivery_sample_bytes_per_sec: Option<f64>,
     /// `--max-bandwidth-bytes-per-sec`
     cap_bytes_per_sec: Option<f64>,
     /// min(cap, bandwidth x gain): what the allocator divides and the pacing rate
@@ -223,10 +220,7 @@ struct PeerState {
     acked_total: AtomicU64,
     /// `media::VideoRate::received_bytes` as of the previous allocation round
     video_received: AtomicU64,
-    /// video's own brake: (its cap in bytes/s, when it was last cut), see `video_cap`
-    video_brake: Mutex<Option<(f64, Instant)>>,
-    /// (when, bytes/s) video delivered over the last `VIDEO_DELIVERY_WINDOW`, and the rounds in a row its queue was high
-    video_delivery: Mutex<(std::collections::VecDeque<(Instant, f64)>, u32)>,
+    video_brake: Mutex<crate::video_brake::VideoBrake>,
     bandwidth: Mutex<BandwidthStats>,
     gone: AtomicBool,
     /// flips to true when the peer is dropped: its channel tasks end on it, since a closed connection's data channels
@@ -311,8 +305,7 @@ impl PeerState {
             link: Mutex::new(LinkModel::new(config.initial_bandwidth)),
             acked_total: AtomicU64::new(0),
             video_received: AtomicU64::new(0),
-            video_brake: Mutex::new(None),
-            video_delivery: Mutex::new(Default::default()),
+            video_brake: Mutex::new(Default::default()),
             bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
@@ -419,7 +412,16 @@ impl PeerState {
         let (budget, at_cap) = self.budget(&link, known_bandwidth.is_some());
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
-            let brake = self.video_cap(now, budget, per_sec(video_through));
+            let delivery = self.video_rate.delivery();
+            let previous = self.bandwidth.lock().video_estimate_bytes_per_sec;
+            let brake = self.video_brake.lock().observe(
+                now,
+                budget,
+                if previous > 0.0 { previous } else { self.config.initial_bandwidth },
+                per_sec(video_sent),
+                delivery.map(|d| (d.bytes_per_sec, d.least_queue_ms)),
+                self.config.latency_target.as_secs_f64() * 1000.0,
+            );
             let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
             // (a known link: what the page said, in place of GCC's estimate and the brake's)
             let estimate = if known_bandwidth.is_some() { budget } else { estimate };
@@ -470,6 +472,10 @@ impl PeerState {
             // take what the allocation gave a high-priority one (19.8 Hz granted, 16 delivered)
             shared.apply(allocation, link.probing_bandwidth() && !at_cap);
         }
+        let (queue_cap, queue_reason, application_limited) = {
+            let brake = self.video_brake.lock();
+            (brake.cap, brake.reason, brake.application_limited)
+        };
         *self.bandwidth.lock() = BandwidthStats {
             data_estimate_bytes_per_sec: link.bandwidth_bytes_per_sec,
             delivered_bytes_per_sec: link.delivered_bytes_per_sec,
@@ -478,7 +484,12 @@ impl PeerState {
             video_queue_delay_ms: self.video_rate.queue_delay_ms(),
             pacer_delay_ms: self.video_rate.pacer_delay().as_secs_f64() * 1000.0,
             pacer_dropped_packets: self.video_rate.pacer.dropped_packets(),
-            video_brake_bytes_per_sec: self.video_brake.lock().map(|(cap, _)| cap),
+            video_brake_bytes_per_sec: queue_cap,
+            video_brake_reason: queue_reason,
+            video_application_limited: application_limited,
+            video_gcc_cap_bytes_per_sec: self.video_rate.gcc_limit_bytes_per_sec(),
+            video_least_queue_ms: self.video_rate.delivery().map(|d| d.least_queue_ms),
+            video_delivery_sample_bytes_per_sec: self.video_rate.delivery().map(|d| d.bytes_per_sec),
             cap_bytes_per_sec: self.config.max_bandwidth,
             budget_bytes_per_sec: budget,
             gain: link.gain,
@@ -501,41 +512,6 @@ impl PeerState {
             network_blocked_fraction: (blocked_ms / 1000.0 / (interval_secs * active.max(1) as f64)).min(1.0),
             constrained: total_demand > budget,
         };
-    }
-
-    /// Video's own brake, from how long its packets wait in a queue (transport feedback's arrival times): video bypasses
-    /// the send window, so without it the latency target held data only, and at full quality a camera kept a Wi-Fi
-    /// queue of 150-650 ms. When the queue stays over half the latency target (one way, so about the target in a round
-    /// trip) for `VIDEO_QUEUE_ROUNDS` rounds, video is cut to `VIDEO_BRAKE_BACKOFF` of the most it delivered over `VIDEO_DELIVERY_WINDOW`
-    /// (cut from the last round's, a cut lowered what it delivered and the next cut went lower: a spiral), at most once
-    /// per `VIDEO_BRAKE_SPACING`; under a quarter of the target it grows 25% a round (back in about a second), and lets
-    /// go once at the budget.
-    fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
-        // a queue delay with no fresh feedback behind it says nothing (no video got through lately): held at its last value,
-        // it kept braking a link with no video on it for 15 s
-        let queue_ms = self.video_rate.delivery().map_or(0.0, |_| self.video_rate.queue_delay_ms());
-        let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
-        let (recent_most, high_rounds) = {
-            let mut delivery = self.video_delivery.lock();
-            delivery.0.push_back((now, video_delivered));
-            while delivery.0.front().is_some_and(|(at, _)| now.duration_since(*at) > VIDEO_DELIVERY_WINDOW) {
-                delivery.0.pop_front();
-            }
-            delivery.1 = if queue_ms > target_ms / 2.0 { delivery.1 + 1 } else { 0 };
-            (delivery.0.iter().map(|(_, rate)| *rate).fold(0.0, f64::max), delivery.1)
-        };
-        let mut brake = self.video_brake.lock();
-        if high_rounds >= VIDEO_QUEUE_ROUNDS && recent_most > 0.0 {
-            if brake.is_none_or(|(_, at)| now.duration_since(at) >= VIDEO_BRAKE_SPACING) {
-                let cap = brake.map_or(recent_most, |(cap, _)| cap.min(recent_most)) * VIDEO_BRAKE_BACKOFF;
-                *brake = Some((cap, now));
-            }
-        } else if queue_ms < target_ms / 4.0
-            && let Some((cap, at)) = *brake
-        {
-            *brake = (cap * 1.25 < budget).then_some((cap * 1.25, at));
-        }
-        brake.map(|(cap, _)| cap)
     }
 
     /// What data may take to reach the page: the gateway's target, tightened by the latency tolerances the page's streams
@@ -1545,6 +1521,17 @@ async fn remote_address(state: &PeerState) -> Option<String> {
     Some(pair.remote().address.clone())
 }
 
+/// Resolved endpoints on the actual selected path, also when the browser hides addresses behind mDNS.
+async fn selected_path(state: &PeerState) -> Option<Value> {
+    let connection = state.connection.lock().clone()?;
+    let pair = connection.sctp().await?.transport().ice_transport().get_selected_candidate_pair().await.ok()??;
+    let local = pair.local();
+    let remote = pair.remote();
+    Some(json!({"peerId": state.peer_id,
+        "local": {"address": local.address, "port": local.port, "protocol": local.protocol.to_string(), "type": local.typ.to_string()},
+        "remote": {"address": remote.address, "port": remote.port, "protocol": remote.protocol.to_string(), "type": remote.typ.to_string()}}))
+}
+
 /// Whether `address` is one of this machine's own (loopback, or an interface's: binding to it works); a name (a
 /// browser's mDNS `<uuid>.local`) can't be told, and is taken at the page's word.
 fn on_this_machine(address: &str) -> bool {
@@ -1629,9 +1616,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
                 let heartbeat = json!(state.heartbeat.lock().clone());
                 let bandwidth = json!(state.bandwidth.lock().clone());
+                let path = tokio::time::timeout(Duration::from_millis(50), selected_path(&state)).await.ok().flatten();
                 ok(
                     &request.id,
-                    json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}),
+                    json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "selectedPath": path, "memory": state.memory_counts()}),
                 )
             }
             "setDeadman" => set_deadman(&state, &request).await,
