@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        OnceLock,
+        OnceLock, Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
@@ -23,9 +23,14 @@ enum Record {
     Event(Value),
     Flush(SyncSender<()>),
 }
-static WRITER: OnceLock<Option<SyncSender<Record>>> = OnceLock::new();
+#[derive(Clone)]
+struct Writer {
+    sender: SyncSender<Record>,
+    drops: Arc<AtomicU64>,
+}
+static WRITER: OnceLock<parking_lot::RwLock<Option<Writer>>> = OnceLock::new();
+static WATCHER: OnceLock<()> = OnceLock::new();
 static IDS: AtomicU64 = AtomicU64::new(1);
-static DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Local monotonic timestamp and its explicitly identified clock domain.
 pub fn clock() -> (u64, String) {
@@ -107,20 +112,94 @@ pub fn unwrap_put(bytes: &[u8]) -> Result<(Value, Vec<u8>, Vec<u8>), &'static st
     Ok((trace, attachment, bytes[4 + n..].to_vec()))
 }
 
-fn writer() -> Option<&'static SyncSender<Record>> {
-    WRITER.get_or_init(|| {
-        let mode=std::env::var("DIMOS_DIAGNOSTICS").ok()?;
-        if mode!="trace" && mode!="metrics" {return None;}
+#[derive(Clone, PartialEq)]
+struct SessionConfig {
+    root: PathBuf,
+    run: String,
+    mode: String,
+    generation: String,
+}
+
+fn capture_root() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("DIMOS_DIAGNOSTICS_DIR") {
+        if !root.is_empty() { return Some(PathBuf::from(root)); }
+    }
+    let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+    Some(state.join("dimos/diagnostics"))
+}
+
+fn read_session(root: PathBuf) -> Option<SessionConfig> {
+    let path = root.join("session.json");
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 4096 { return None; }
+    let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if value["schema"] != "dimos.diagnostics.session/v1" { return None; }
+    let run = value["run_id"].as_str()?.to_owned();
+    let mode = value["mode"].as_str()?.to_owned();
+    let generation = value["generation"].as_str()?.to_owned();
+    valid_session(&run, &mode).then_some(SessionConfig {root,run,mode,generation})
+}
+
+fn valid_session(run: &str, mode: &str) -> bool {
+    !run.is_empty() && run.len() <= 128 && run.bytes().all(|c| c.is_ascii_alphanumeric() || c==b'-' || c==b'_')
+        && matches!(mode,"trace"|"metrics")
+}
+
+fn configured_session() -> Option<SessionConfig> {
+    let root = capture_root()?;
+    if let Ok(mode) = std::env::var("DIMOS_DIAGNOSTICS") {
+        if mode == "off" { return None; }
         let run = std::env::var("DIMOS_DIAGNOSTICS_RUN").ok()?;
-        if run.is_empty() || run.len() > 128 || !run.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') { return None; }
-        let root = PathBuf::from(std::env::var("DIMOS_DIAGNOSTICS_DIR").ok()?);
+        return valid_session(&run,&mode).then_some(SessionConfig {root,run,mode,generation:"environment".into()});
+    }
+    read_session(root)
+}
+
+/// Follow the explicitly started host session outside media/control callbacks.
+/// Uses the existing gateway process; no socket, daemon or robot command is added.
+pub fn start_session_watch() {
+    WATCHER.get_or_init(|| {
+        let initial = configured_session();
+        let sender = initial.as_ref().and_then(start_writer);
+        let slot = WRITER.get_or_init(|| parking_lot::RwLock::new(None));
+        *slot.write() = sender;
+        let _ = std::thread::Builder::new().name("diagnostic-session".into()).spawn(move || {
+            let mut current = initial;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let next = configured_session();
+                if next != current {
+                    // Dropping the old sender drains and closes its collector. A new
+                    // run gets a new process identity; records cannot cross sessions.
+                    *slot.write() = None;
+                    let next_writer = next.as_ref().and_then(start_writer);
+                    *slot.write() = next_writer;
+                    current = next;
+                }
+            }
+        });
+    });
+}
+
+fn writer() -> Option<Writer> {
+    start_session_watch();
+    WRITER.get()?.read().clone()
+}
+
+fn start_writer(config: &SessionConfig) -> Option<Writer> {
+        let root = config.root.clone();
+        let run = config.run.clone();
+        let mode = config.mode.clone();
         let reservation = Reservation::reserve(&root,32*1024*1024).ok()?;
         if reservation.bytes < 4*1024*1024 { return None; }
         let process=format!("gateway-{}-{}",std::process::id(),wall());
         let directory=root.join(&run).join(&process);
         let manifest=json!({"kind":"manifest","schema":"dimos.incident/v1","run_id":run,"process":process,"pid":std::process::id(),
-            "wall_ns":wall() as u64,"mono_ns":clock().0,"mode":mode,"clock_domain":clock().1,"build":env!("CARGO_PKG_VERSION"),"host":clock().1.split('/').next().unwrap_or("unknown"),"coverage":"gateway application boundaries"});
+            "wall_ns":wall() as u64,"mono_ns":clock().0,"mode":mode,"clock_domain":clock().1,"build":env!("CARGO_PKG_VERSION"),"host":clock().1.split('/').next().unwrap_or("unknown"),"coverage":"gateway application boundaries","collector":"gateway"});
         let (tx,rx)=sync_channel::<Record>(128);
+        let drops=Arc::new(AtomicU64::new(0));
+        let writer=Writer {sender:tx,drops:drops.clone()};
         std::thread::Builder::new().name("gateway-diagnostics".into()).spawn(move || {
             if fs::create_dir_all(&directory).is_err(){return;}
             let ring_limit=(reservation.bytes*3/4).min(16*1024*1024);
@@ -129,12 +208,16 @@ fn writer() -> Option<&'static SyncSender<Record>> {
             let mut saved=Instant::now();let mut checked=Instant::now()-Duration::from_secs(1);
             let mut pending: Option<(Instant,String)>=None;
             let mut stages=serde_json::Map::new();
+            let mut last_events=serde_json::Map::new();
             loop {
                 let now=Instant::now();let mut stop=false;let mut flush=false;let mut ack=None;
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(Record::Flush(reply))=>{flush=true;ack=Some(reply);}
                     Ok(Record::Event(mut event))=>{
                         event["process"]=manifest["process"].clone();
+                        if let Some(name)=event["event"].as_str() {
+                            if last_events.contains_key(name) || last_events.len()<512 {last_events.insert(name.to_owned(),json!(wall() as u64));}
+                        }
                         if let (Some(stage),Some(duration))=(event["event"].as_str(),event["duration_ns"].as_u64()){record_duration(&mut stages,stage.trim_end_matches(".end"),duration);}
                         if (event["outcome"]=="error" || event["duration_ns"].as_u64().is_some_and(|v|v>100_000_000)) && pending.is_none() {
                             pending=Some((now+Duration::from_secs(30),event["event"].as_str().unwrap_or("slow").to_string()));
@@ -142,7 +225,7 @@ fn writer() -> Option<&'static SyncSender<Record>> {
                         if let Ok(mut row)=serde_json::to_vec(&event) {
                             row.push(b'\n');
                             if mode=="trace" && row.len()<=65536 {if ring.push(&row,now).is_err(){errors+=1;}}
-                            else if mode=="trace" {DROPS.fetch_add(1,Ordering::Relaxed);}
+                            else if mode=="trace" {drops.fetch_add(1,Ordering::Relaxed);}
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>stop=true,
@@ -160,9 +243,9 @@ fn writer() -> Option<&'static SyncSender<Record>> {
                     }
                 }
                 let due=pending.as_ref().is_some_and(|(until,_)|now>=*until);
-                let health=json!({"observer_drops":DROPS.load(Ordering::Relaxed),"ring_evictions":ring.evictions,"io_errors":errors,"ring_bytes":ring.size(),"raw_ring_bytes":ring.raw_bytes,
+                let health=json!({"observer_drops":drops.load(Ordering::Relaxed),"ring_evictions":ring.evictions,"io_errors":errors,"ring_bytes":ring.size(),"raw_ring_bytes":ring.raw_bytes,
                     "memory_reserved_bytes":reservation.bytes,"ring_limit_bytes":ring_limit,"requested_pre_seconds":60,"requested_post_seconds":30,
-                    "stages":stages,"mode":mode,"retained_seconds":now.saturating_duration_since(started.max(cutoff).max(ring.capacity_lost_until.unwrap_or(started))).as_secs_f64(),"capture_window_complete":mode=="trace" && started<=cutoff && ring.capacity_lost_until.is_none_or(|at|at<=cutoff) && (pending.is_none() || due),"capacity_truncated":ring.capacity_lost_until.is_some_and(|at|at>cutoff)});
+                    "stages":stages,"last_events":last_events,"mode":mode,"retained_seconds":now.saturating_duration_since(started.max(cutoff).max(ring.capacity_lost_until.unwrap_or(started))).as_secs_f64(),"capture_window_complete":mode=="trace" && started<=cutoff && ring.capacity_lost_until.is_none_or(|at|at<=cutoff) && (pending.is_none() || due),"capacity_truncated":ring.capacity_lost_until.is_some_and(|at|at>cutoff)});
                 if flush || stop || due || saved.elapsed()>=Duration::from_secs(5) {
                     let mut header=manifest.clone();header["health"]=health.clone();
                     header["captured_ns"]=clock().0.into();
@@ -181,18 +264,17 @@ fn writer() -> Option<&'static SyncSender<Record>> {
                 if stop {break;}
             }
         }).ok()?;
-        Some(tx)
-    }).as_ref()
+        Some(writer)
 }
 
 /// Flush queued evidence at graceful server shutdown, outside the async/control path.
 /// Does not stop the process-wide collector when another server is still using it.
 pub fn flush() {
-    let Some(writer) = WRITER.get().and_then(|v| v.as_ref()) else {
+    let Some(writer) = WRITER.get().and_then(|v| v.read().clone()) else {
         return;
     };
     let (tx, rx) = sync_channel(1);
-    if writer.send(Record::Flush(tx)).is_ok() {
+    if writer.sender.send(Record::Flush(tx)).is_ok() {
         let _ = rx.recv_timeout(Duration::from_secs(5));
     }
 }
@@ -214,8 +296,8 @@ pub fn event(name: &str, context: Option<&Value>, labels: Value) {
     value["mono_ns"] = at.into();
     value["clock_domain"] = domain.into();
     value["context"] = context.cloned().unwrap_or(Value::Null);
-    if writer.try_send(Record::Event(value)).is_err() {
-        DROPS.fetch_add(1, Ordering::Relaxed);
+    if writer.sender.try_send(Record::Event(value)).is_err() {
+        writer.drops.fetch_add(1, Ordering::Relaxed);
     }
 }
 /// Local processing duration with the input sample identity.

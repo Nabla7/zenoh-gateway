@@ -6,6 +6,7 @@
 
 import {TraceRecorder, traceSchema, traceContext, tracePayload, type TraceContext} from "./diagnostics.ts"
 export {TraceRecorder} from "./diagnostics.ts"
+export {DiagnosticSession, openDiagnostics, TraceUpload} from "./diagnostics_session.ts"
 import { decompress as zstdDecompress } from "./vendor/fzstd.ts"
 
 /** zenoh priorities (lower = more important). */

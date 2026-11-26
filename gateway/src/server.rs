@@ -567,6 +567,7 @@ impl Server {
     /// The HTTP routes: `POST /offer` (WebRTC signaling, CORS-permissive), `GET` [`HEALTH_PATH`] and [`ICE_PATH`] and, with
     /// [`ServerBuilder::serve_dir`], static files. Mount it in a host's axum server; call [`shutdown`](Self::shutdown) when it stops.
     pub fn router(&self) -> Router {
+        crate::diagnostics::start_session_watch();
         let mut router = Router::new()
             .route("/offer", post(offer))
             .route(HEALTH_PATH, get(health))

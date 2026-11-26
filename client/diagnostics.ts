@@ -27,7 +27,7 @@ export function tracePayload(payload: Uint8Array, context: TraceContext): Uint8A
 }
 
 export class TraceRecorder {
-    readonly process = crypto.randomUUID();
+    readonly process = `browser-${crypto.randomUUID()}`;
     readonly clockDomain = `browser/${this.process}/performance`;
     private sequences = new Map<string, number>();
     private events: TraceEvent[] = [];
@@ -36,6 +36,8 @@ export class TraceRecorder {
     private spanId = 0;
     private watches = new Map<string, {at:number,context?:TraceContext}>();
     private lastTick = 0;
+    private closed = false;
+    close(): void { this.closed = true; this.events = []; this.bytes = 0; this.watches.clear(); }
     constructor(readonly runId: string, readonly maxBytes = 4 * 1024 * 1024, readonly maxEvents = 4096) {
         if (!/^[a-zA-Z0-9_-]{1,128}$/.test(runId) || maxBytes < 1024 || maxBytes > 16*1024*1024 || maxEvents < 1 || maxEvents > 16384) throw new Error('invalid trace configuration');
     }
@@ -46,6 +48,7 @@ export class TraceRecorder {
         return {schema:traceSchema,run_id:this.runId,publisher:this.process,stream,sequence,origin_ns:originNs,clock_domain:this.clockDomain,parents:[],lineage:'complete'};
     }
     event(event: string, context?: TraceContext | null, labels: Record<string, unknown> = {}): void {
+        if (this.closed) return;
         const row: TraceEvent = {...labels,schema:traceSchema,event,mono_ns:this.now(),clock_domain:this.clockDomain,process:this.process,context:context??null};
         let encoded: string;
         try { encoded = JSON.stringify(row); } catch { this.drops++; return; }
